@@ -43,25 +43,4 @@ func loadconfig() {
 
 func main() {
 	loadconfig()
-	// args := os.Args[1:]
-	// if len(args) == 0 {
-	// 	fmt.Fprintln(os.Stderr, "usage: gcc-runner <gcc arguments>")
-	// 	os.Exit(2)
-	// }
-
-	// command := exec.Command("gcc", args...)
-	// command.Stdout = os.Stdout
-	// command.Stderr = os.Stderr
-
-	// fmt.Fprintln(os.Stderr, "gcc ", args)
-
-	// if err := command.Run(); err != nil {
-	// 	fmt.Fprintf(os.Stderr, "gcc failed: %v\n", err)
-
-	// 	var exitError *exec.ExitError
-	// 	if errors.As(err, &exitError) && exitError.ExitCode() > 0 {
-	// 		os.Exit(exitError.ExitCode())
-	// 	}
-	// 	os.Exit(1)
-	// }
 }
