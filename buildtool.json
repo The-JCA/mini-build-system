@@ -1,0 +1,22 @@
+{
+  "targets": [
+    {
+      "name": "app",
+      "inputs": ["build/main.o", "build/parser.o"],
+      "output": "build/app",
+      "command": ["gcc", "build/main.o", "build/parser.o", "-o", "build/app"]
+    },
+    {
+      "name": "main",
+      "inputs": ["example/main.c", "example/parser.h"],
+      "output": "build/main.o",
+      "command": ["gcc", "-c", "example/main.c", "-o", "build/main.o"]
+    },
+    {
+      "name": "parser",
+      "inputs": ["example/parser.c", "example/parser.h"],
+      "output": "build/parser.o",
+      "command": ["gcc", "-c", "example/parser.c", "-o", "build/parser.o"]
+    }
+  ]
+}   
