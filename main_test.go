@@ -3,6 +3,10 @@ package main
 import (
 	"slices"
 	"testing"
+	"path/filepath"
+	"os/exec"
+	"os"
+	"strings"
 )
 
 func TestCollectBuildOrder(t *testing.T) {
@@ -103,4 +107,105 @@ func TestCycle(t *testing.T) {
 		t.Fatalf("error = %q, want %q", got, want)
 	}
 
+}
+
+
+func TestChangeOutputfile(t *testing.T){
+	workspace := t.TempDir()
+	binary := filepath.Join(workspace, "buildtool")
+
+	cmd := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build tool: %v\n%s", err, output)
+	}
+
+	if err := os.MkdirAll(filepath.Join(workspace, "example"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{"buildtool.json", "example/main.c", "example/parser.h"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if err := os.WriteFile(filepath.Join(workspace, path), data, 0644); err != nil {
+			t.Fatalf("copy %s: %v", path, err)
+		}
+	}
+
+
+	buildMain := func() string {
+    t.Helper()
+
+    cmd := exec.Command(binary, "build", "main")
+    cmd.Dir = workspace
+    output, err := cmd.CombinedOutput()
+    if err != nil {
+        t.Fatalf("build main: %v\n%s", err, output)
+    }
+    return string(output)
+	}
+
+	buildMain()
+	
+
+	sourcePath := filepath.Join(workspace, "example", "main.c")
+	objectPath := filepath.Join(workspace, "build", "main.o")
+	statePath := filepath.Join(workspace, "build", ".fingerprints.json")
+
+	achecksum,err:=fileChecksum(objectPath)
+	if err!=nil{
+		t.Fatal(err)
+	}
+
+	sourceA,err := os.ReadFile(sourcePath)
+	if err != nil {
+			t.Fatalf("read %s: %v", sourcePath, err)
+	}
+
+	outputAfp,err := os.ReadFile(statePath)
+	if err != nil {
+			t.Fatalf("read %s: %v", statePath, err)
+	}
+
+	
+	data,err := os.ReadFile("example/mainb.c")
+	if err != nil {
+			t.Fatalf("read %s: %v", "example/mainb.c", err)
+	}
+	if err := os.WriteFile(sourcePath, data, 0644); err != nil {
+			t.Fatalf("copy %s: %v", sourcePath, err)
+	}
+
+	buildMain()
+	bchecksum,err:=fileChecksum(objectPath)
+	if err!=nil{
+		t.Fatal(err)
+	}
+	if (achecksum==bchecksum){
+		t.Fatal("Checksums of A and B are equal")
+	}
+
+
+	if err := os.WriteFile(sourcePath, sourceA, 0644); err != nil {
+			t.Fatalf("copy %s: %v", sourcePath, err)
+	}
+
+	if err := os.WriteFile(statePath, outputAfp, 0644); err != nil {
+			t.Fatalf("copy %s: %v", statePath, err)
+	}
+
+
+	buildMain()
+	testchecksum,err:=fileChecksum(objectPath)
+	if err!=nil{
+		t.Fatal(err)
+	}
+	if achecksum!=testchecksum{
+		t.Fatal("Checksum after restoration is not equal to Checksum of Version A")
+	}
+
+	if output := buildMain(); !strings.Contains(output, "skipping main: up to date") {
+    t.Fatalf("expected unchanged build to skip main, got:\n%s", output)
+}
 }
