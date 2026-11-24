@@ -3,13 +3,13 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
-	"errors"
 )
 
 type Config struct {
@@ -34,8 +34,8 @@ type fingerprintData struct {
 }
 
 type BuildRecord struct {
-    InputFingerprint string `json:"input_fingerprint"`
-    OutputChecksum   string `json:"output_checksum"`
+	InputFingerprint string `json:"input_fingerprint"`
+	OutputChecksum   string `json:"output_checksum"`
 }
 
 func loadconfig(tgt_name string) error {
@@ -96,8 +96,7 @@ func loadconfig(tgt_name string) error {
 		if err != nil {
 			return fmt.Errorf("couldn't fingerprint target %q: %w", target.Name, err)
 		}
-		
-		
+
 		fmt.Printf("%s fingerprint: %s\n", target.Name, fingerprint)
 
 		record, ok := fpmap[target.Output]
@@ -115,13 +114,15 @@ func loadconfig(tgt_name string) error {
 		if err := runTarget(target); err != nil {
 			return err
 		}
-		
+		if os.Getenv("BUILDTOOL_TEST_INTERRUPT") == "before-build-record-save" {
+			os.Exit(86)
+		}
 		newchecksum, err := fileChecksum(target.Output)
-		if err!=nil{
-			return fmt.Errorf("%q: %w",target.Name,err)
+		if err != nil {
+			return fmt.Errorf("%q: %w", target.Name, err)
 		}
 		fpmap[target.Output] = BuildRecord{InputFingerprint: fingerprint,
-		OutputChecksum: newchecksum}
+			OutputChecksum: newchecksum}
 		value, err := json.Marshal(fpmap)
 		if err != nil {
 			return fmt.Errorf("couldn't convert to Json: %w", err)
@@ -234,16 +235,21 @@ func runTarget(target Target) error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("target %q failed:%w", target.Name, err)
 	}
+
+	if os.Getenv("BUILDTOOL_TEST_INTERRUPT") == "before-output-rename" {
+		os.Exit(86)
+	}
+
 	if err := os.Rename(path, target.Output); err != nil {
 		return fmt.Errorf("replace %q output file: %w", target.Name, err)
 	}
 	return nil
 }
 
-func fileChecksum(path string) (string, error){
-	data,err := os.ReadFile(path)
+func fileChecksum(path string) (string, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
-			return "", fmt.Errorf("couldn't read %q: %w", path, err)
+		return "", fmt.Errorf("couldn't read %q: %w", path, err)
 	}
 
 	sum := sha256.Sum256(data)
