@@ -487,3 +487,121 @@ func TestPlannedInteruption(t *testing.T) {
 		})
 	}
 }
+
+func gccCommandLines(output string) []string {
+	var commands []string
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "[gcc ") {
+			commands = append(commands, line)
+		}
+	}
+	return commands
+}
+
+func TestFullAppIncrementalBuild(t *testing.T) {
+	workspace := t.TempDir()
+	binary := filepath.Join(workspace, "buildtool")
+
+	cmd := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build tool: %v\n%s", err, output)
+	}
+
+	if err := os.MkdirAll(filepath.Join(workspace, "example"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{"buildtool.json", "example/main.c", "example/parser.h", "example/parser.c"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if err := os.WriteFile(filepath.Join(workspace, path), data, 0644); err != nil {
+			t.Fatalf("copy %s: %v", path, err)
+		}
+	}
+
+	buildApp := func() string {
+		t.Helper()
+
+		cmd := exec.Command(binary, "build", "app")
+		cmd.Dir = workspace
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("build App: %v\n%s", err, output)
+		}
+		return string(output)
+	}
+
+	assertCommands := func(stage, output string, want ...string) {
+		t.Helper()
+
+		got := gccCommandLines(output)
+		if len(got) != len(want) {
+			t.Fatalf("%s ran %d GCC commands, want %d\n%s",
+				stage, len(got), len(want), output)
+		}
+		for i, fragment := range want {
+			if !strings.Contains(got[i], fragment) {
+				t.Fatalf("%s command %d = %q, want it to contain %q",
+					stage, i+1, got[i], fragment)
+			}
+		}
+	}
+
+	appendComment := func(path string) {
+		t.Helper()
+
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatalf("open %s: %v", path, err)
+		}
+		_, writeErr := file.WriteString("\n/* comment-only edit */\n")
+		closeErr := file.Close()
+		if writeErr != nil {
+			t.Fatalf("append comment to %s: %v", path, writeErr)
+		}
+		if closeErr != nil {
+			t.Fatalf("close %s: %v", path, closeErr)
+		}
+	}
+
+	const (
+		compileMain   = "-c example/main.c"
+		compileParser = "-c example/parser.c"
+		linkApp       = "build/main.o build/parser.o"
+	)
+
+	assertCommands("clean build", buildApp(), compileMain, compileParser, linkApp)
+	assertCommands("unchanged build", buildApp())
+
+	parserPath := filepath.Join(workspace, "example", "parser.c")
+	appendComment(parserPath)
+	output := buildApp()
+	assertCommands("parser comment edit", output, compileParser)
+	if !strings.Contains(output, "skipping app: up to date") {
+		t.Fatalf("expected app to skip after the parser comment edit:\n%s", output)
+	}
+
+	source, err := os.ReadFile(parserPath)
+	if err != nil {
+		t.Fatalf("read parser source: %v", err)
+	}
+	edited := strings.Replace(string(source), "return digit - '0';", "return digit - '0' + 1;", 1)
+	if edited == string(source) {
+		t.Fatal("expected to find parse_digit's return statement")
+	}
+	if err := os.WriteFile(parserPath, []byte(edited), 0644); err != nil {
+		t.Fatalf("write parser source: %v", err)
+	}
+	assertCommands("parser code edit", buildApp(), compileParser, linkApp)
+
+	headerPath := filepath.Join(workspace, "example", "parser.h")
+	appendComment(headerPath)
+	output = buildApp()
+	assertCommands("shared header comment edit", output, compileMain, compileParser)
+	if !strings.Contains(output, "skipping app: up to date") {
+		t.Fatalf("expected app to skip after the shared header comment edit:\n%s", output)
+	}
+
+}
