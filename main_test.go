@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestCollectBuildOrder(t *testing.T) {
@@ -603,5 +605,351 @@ func TestFullAppIncrementalBuild(t *testing.T) {
 	if !strings.Contains(output, "skipping app: up to date") {
 		t.Fatalf("expected app to skip after the shared header comment edit:\n%s", output)
 	}
+}
 
+func TestExternalKillRecovery(t *testing.T) {
+	workspace := t.TempDir()
+	binary := filepath.Join(workspace, "buildtool")
+
+	cmd := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build tool: %v\n%s", err, output)
+	}
+
+	if err := os.MkdirAll(filepath.Join(workspace, "example"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{"buildtool.json", "example/main.c", "example/parser.h", "example/parser.c"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if err := os.WriteFile(filepath.Join(workspace, path), data, 0644); err != nil {
+			t.Fatalf("copy %s: %v", path, err)
+		}
+	}
+
+	buildApp := func() string {
+		t.Helper()
+
+		cmd := exec.Command(binary, "build", "app")
+		cmd.Dir = workspace
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("build App: %v\n%s", err, output)
+		}
+		return string(output)
+	}
+
+	buildApp()
+	objectPath := filepath.Join(workspace, "build", "parser.o")
+	statePath := filepath.Join(workspace, "build", ".fingerprints.json")
+	parserAdata, err := os.ReadFile(objectPath)
+	if err != nil {
+		t.Fatalf("read parser source: %v", err)
+	}
+	stateAdata, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state source: %v", err)
+	}
+
+	parserPath := filepath.Join(workspace, "example", "parser.c")
+	source, err := os.ReadFile(parserPath)
+	if err != nil {
+		t.Fatalf("read parser source: %v", err)
+	}
+	edited := strings.Replace(string(source), "return digit - '0';", "return digit - '0' + 1;", 1)
+	if edited == string(source) {
+		t.Fatal("expected to find parse_digit's return statement")
+	}
+	if err := os.WriteFile(parserPath, []byte(edited), 0644); err != nil {
+		t.Fatalf("write parser source: %v", err)
+	}
+
+	marker := filepath.Join(workspace, "ready-to-kill")
+	cmd = exec.Command(binary, "build", "app")
+	cmd.Dir = workspace
+	cmd.Env = append(cmd.Environ(), "BUILDTOOL_TEST_PAUSE_FILE="+marker)
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start build: %v", err)
+	}
+	defer func() {
+		if cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := os.Stat(marker)
+		if err == nil {
+			break
+		}
+		if !os.IsNotExist(err) {
+			t.Fatalf("check pause marker: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("build never reached the pause before output rename")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill build: %v", err)
+	}
+	err = cmd.Wait()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != -1 {
+		t.Fatalf("expected build to be killed, got %v", err)
+	}
+
+	buildPath := filepath.Join(workspace, "build")
+	contents, err := os.ReadDir(buildPath)
+	if err != nil {
+		t.Fatalf("read build directory after kill: %v", err)
+	}
+
+	foundStagingDir := false
+	for _, entry := range contents {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), ".output-") {
+			foundStagingDir = true
+			break
+		}
+	}
+	if !foundStagingDir {
+		t.Fatal("expected the kill to leave a .output-* staging directory")
+	}
+
+	data, err := os.ReadFile(objectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(data, parserAdata) {
+		t.Fatal("Parser output is affected")
+	}
+
+	data, err = os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(data, stateAdata) {
+		t.Fatal("kill changed the save build state")
+	}
+
+	output := buildApp()
+	lines := gccCommandLines(output)
+	if len(lines) != 2 || !strings.Contains(lines[0], "-c example/parser.c") ||
+		!strings.Contains(lines[1], "build/main.o build/parser.o") {
+		t.Fatalf("Expected parser recompile and app relink\n%v", output)
+	}
+	contents, err = os.ReadDir(buildPath)
+	if err != nil {
+		t.Fatalf("read build directory after retry: %v", err)
+	}
+
+	var names []string
+	for _, entry := range contents {
+		names = append(names, entry.Name())
+	}
+	want := []string{".fingerprints.json", "app", "main.o", "parser.o"}
+	if !slices.Equal(names, want) {
+		t.Fatalf("build entries after retry = %q, want %q", names, want)
+	}
+
+	output = buildApp()
+	lines = gccCommandLines(output)
+	if len(lines) != 0 {
+		t.Fatalf("Expected no recompile\n%v", output)
+	}
+
+	buildpath := filepath.Join(workspace, "build")
+	recoveredbuildpath := filepath.Join(workspace, "recovered-build")
+
+	if err := os.Rename(buildpath, recoveredbuildpath); err != nil {
+		t.Fatalf("move recovered build aside: %v", err)
+	}
+
+	output = buildApp()
+	if got := len(gccCommandLines(output)); got != 3 {
+		t.Fatalf("clean reference build ran %d GCC commands, want 3\n%s", got, output)
+	}
+
+	for _, path := range []string{"main.o", "parser.o", ".fingerprints.json", "app"} {
+		newbuilddata, err := os.ReadFile(filepath.Join(buildpath, path))
+		if err != nil {
+			t.Fatalf("error reading %q in new build: %v", path, err)
+		}
+		recoveredbuilddata, err := os.ReadFile(filepath.Join(recoveredbuildpath, path))
+		if err != nil {
+			t.Fatalf("error reading %q in recovered build: %v", path, err)
+		}
+		if !slices.Equal(newbuilddata, recoveredbuilddata) {
+			t.Fatalf("Data of recovered build doesn't match clearn for %q", path)
+		}
+	}
+}
+
+func TestTimedKillRecovery(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "buildtool")
+
+	cmd := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build tool: %v\n%s", err, output)
+	}
+
+	buildApp := func(t *testing.T, workspace string) string {
+		t.Helper()
+
+		cmd := exec.Command(binary, "build", "app")
+		cmd.Dir = workspace
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("build App: %v\n%s", err, output)
+		}
+		return string(output)
+	}
+
+	runTimedKillTrial := func(t *testing.T, binary string, delay time.Duration, edit string) bool {
+		t.Helper()
+		workspace := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(workspace, "example"), 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		for _, path := range []string{"buildtool.json", "example/main.c", "example/parser.h", "example/parser.c"} {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read %s: %v", path, err)
+			}
+			if err := os.WriteFile(filepath.Join(workspace, path), data, 0644); err != nil {
+				t.Fatalf("copy %s: %v", path, err)
+			}
+		}
+		buildApp(t, workspace)
+
+		switch edit {
+		case "none":
+			// Leave the source files as they are.
+		case "main.c":
+			Path := filepath.Join(workspace, "example", "main.c")
+			source, err := os.ReadFile(Path)
+			if err != nil {
+				t.Fatalf("read main source: %v", err)
+			}
+			edited := strings.Replace(string(source), "parse_digit('7')", "parse_digit('8')", 1)
+			if edited == string(source) {
+				t.Fatal("expected to find 7 in main")
+			}
+			if err := os.WriteFile(Path, []byte(edited), 0644); err != nil {
+				t.Fatalf("write main source: %v", err)
+			}
+		case "parser.c":
+			parserPath := filepath.Join(workspace, "example", "parser.c")
+			source, err := os.ReadFile(parserPath)
+			if err != nil {
+				t.Fatalf("read parser source: %v", err)
+			}
+			edited := strings.Replace(string(source), "return digit - '0';", "return digit - '0' + 1;", 1)
+			if edited == string(source) {
+				t.Fatal("expected to find parse_digit's return statement")
+			}
+			if err := os.WriteFile(parserPath, []byte(edited), 0644); err != nil {
+				t.Fatalf("write parser source: %v", err)
+			}
+		case "parser.h":
+			Path := filepath.Join(workspace, "example", "parser.h")
+			source, err := os.ReadFile(Path)
+			if err != nil {
+				t.Fatalf("read main source: %v", err)
+			}
+			edited := string(source) + "\n/* timed-kill test edit */\n"
+			if err := os.WriteFile(Path, []byte(edited), 0644); err != nil {
+				t.Fatalf("write parser header: %v", err)
+			}
+		default:
+			t.Fatalf("unknown edit %q", edit)
+		}
+
+		cmd := exec.Command(binary, "build", "app")
+		cmd.Dir = workspace
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start build: %v", err)
+		}
+
+		time.Sleep(delay)
+
+		killErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		waitErr := cmd.Wait()
+
+		if killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+			t.Fatalf("kill build process group: %v", killErr)
+		}
+		if waitErr == nil {
+			return false
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(waitErr, &exitErr) {
+			t.Fatalf("wait for build: %v", waitErr)
+		}
+		status, ok := exitErr.Sys().(syscall.WaitStatus)
+		if !ok || status.Signal() != syscall.SIGKILL {
+			t.Fatalf("expected SIGKILL after %s, got %v", delay, waitErr)
+		}
+
+		buildApp(t, workspace)
+
+		buildpath := filepath.Join(workspace, "build")
+		recoveredbuildpath := filepath.Join(workspace, "recovered-build")
+
+		if err := os.Rename(buildpath, recoveredbuildpath); err != nil {
+			t.Fatalf("move recovered build aside: %v", err)
+		}
+
+		output := buildApp(t, workspace)
+		if got := len(gccCommandLines(output)); got != 3 {
+			t.Fatalf("clean reference build ran %d GCC commands, want 3\n%s", got, output)
+		}
+
+		for _, path := range []string{"main.o", "parser.o", ".fingerprints.json", "app"} {
+			newbuilddata, err := os.ReadFile(filepath.Join(buildpath, path))
+			if err != nil {
+				t.Fatalf("error reading %q in new build: %v", path, err)
+			}
+			recoveredbuilddata, err := os.ReadFile(filepath.Join(recoveredbuildpath, path))
+			if err != nil {
+				t.Fatalf("error reading %q in recovered build: %v", path, err)
+			}
+			if !slices.Equal(newbuilddata, recoveredbuilddata) {
+				t.Fatalf("Data of recovered build doesn't match clean build for %q", path)
+			}
+		}
+		return true
+	}
+
+	const seed = 36
+	rng := rand.New(rand.NewSource(seed))
+
+	kills, completed := 0, 0
+	edits := []string{"none", "main.c", "parser.c", "parser.h"}
+	for i := 0; i < 10; i++ {
+		delay := time.Duration(1+rng.Intn(20)) * time.Millisecond
+		edit := edits[i%len(edits)]
+		name := fmt.Sprintf("seed-%d/trial-%02d/edit-%s/delay-%s", seed, i, edit, delay)
+		t.Run(name, func(t *testing.T) {
+			if runTimedKillTrial(t, binary, delay, edit) {
+				kills++
+			} else {
+				completed++
+			}
+		})
+	}
+	t.Logf("confirmed kills: %d, completed before kill: %d", kills, completed)
+	if kills == 0 {
+		t.Fatal("no trial exercised crash recovery")
+	}
 }
