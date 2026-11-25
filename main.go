@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
+	"time"
 )
 
 type Config struct {
@@ -74,6 +76,25 @@ func loadconfig(tgt_name string) error {
 	if err := os.MkdirAll("build", 0755); err != nil {
 		return fmt.Errorf("couldn't create build directory: %w", err)
 	}
+
+	lockFile, err := os.OpenFile(".buildtool.lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("open workspace lock: %w", err)
+	}
+	defer lockFile.Close()
+
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock workspace: %w", err)
+	}
+
+	if err := cleanBuildTemps("build"); err != nil {
+		return err
+	}
+
+	if err := cleanBuildTemps("build"); err != nil {
+		return err
+	}
+
 	fpdata, err := os.ReadFile("build/.fingerprints.json")
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("trouble opening build/.fingerprints.json: %w", err)
@@ -240,6 +261,16 @@ func runTarget(target Target) error {
 		os.Exit(86)
 	}
 
+	//pause for external kill recovery
+	if marker := os.Getenv("BUILDTOOL_TEST_PAUSE_FILE"); marker != "" {
+		if err := os.WriteFile(marker, []byte("ready\n"), 0600); err != nil {
+			return fmt.Errorf("write pause marker: %w", err)
+		}
+		for {
+			time.Sleep(time.Second)
+		}
+	}
+
 	if err := os.Rename(path, target.Output); err != nil {
 		return fmt.Errorf("replace %q output file: %w", target.Name, err)
 	}
@@ -254,6 +285,26 @@ func fileChecksum(path string) (string, error) {
 
 	sum := sha256.Sum256(data)
 	return fmt.Sprintf("%x", sum), nil
+}
+func cleanBuildTemps(path string) error {
+	contents, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range contents {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".output-") {
+			if err := os.RemoveAll(filepath.Join(path, name)); err != nil {
+				return err
+			}
+		} else if entry.Type().IsRegular() && strings.HasPrefix(name, ".fingerprints-") &&
+			strings.HasSuffix(name, ".tmp") {
+			if err := os.Remove(filepath.Join(path, name)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func main() {
